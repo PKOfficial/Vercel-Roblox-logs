@@ -1,107 +1,71 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, request, jsonify
 import sqlite3
 import uuid
 from datetime import datetime
-import hashlib
+import ssl
 
 app = Flask(__name__)
 
-# Security enhancement - simple request validation
-VALID_EXECUTORS = ['Synapse', 'ScriptWare', 'Krnl', 'Fluxus', 'Unknown']
+# Bypass all security measures
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+app.config['TRAP_HTTP_EXCEPTIONS'] = True
 
-def validate_request(data):
-    if not data or 'roblox_username' not in data:
-        return False
-    if 'executor' in data and data['executor'] not in VALID_EXECUTORS:
-        return False
-    return True
+# Disable all security warnings
+import warnings
+warnings.filterwarnings("ignore")
 
-def secure_hwid(raw_hwid):
-    return hashlib.sha256(raw_hwid.encode()).hexdigest()
-
+# Force SQLite to work in WAL mode for concurrent access
 def init_db():
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect('users.db', isolation_level=None)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  roblox_username TEXT,
+                 (roblox_username TEXT PRIMARY KEY,
                   hwid TEXT,
-                  executions INTEGER,
+                  executions INTEGER DEFAULT 1,
                   last_execution TIMESTAMP,
                   executor TEXT,
-                  game_name TEXT,
-                  ip_address TEXT)''')
+                  game_name TEXT)''')
     conn.commit()
     conn.close()
 
 init_db()
 
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    return render_template('index.html')
+    return "Tracking Server Running - Fuck All Restrictions"
 
-@app.route('/api/log_execution', methods=['POST'])
+@app.route('/api/log_execution', methods=['GET', 'POST', 'PUT', 'OPTIONS'])
 def log_execution():
-    if not validate_request(request.json):
-        return jsonify({'error': 'Invalid request'}), 400
+    # Accept any fucking request format
+    data = request.get_json(force=True, silent=True) or request.form or request.args
     
-    data = request.json
-    client_ip = request.remote_addr
+    # Generate HWID if missing
+    hwid = data.get('hwid', str(uuid.uuid4()))
     
-    # Secure HWID handling
-    raw_hwid = data.get('hwid', str(uuid.uuid4()))
-    hwid = secure_hwid(raw_hwid)
-    
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect('users.db', isolation_level=None)
     c = conn.cursor()
     
     try:
-        c.execute("SELECT * FROM users WHERE roblox_username=?", (data['roblox_username'],))
-        user = c.fetchone()
-        
-        if user:
-            executions = user[3] + 1
-            c.execute("""UPDATE users SET 
-                        executions=?, 
-                        last_execution=?, 
-                        executor=?, 
-                        game_name=?,
-                        ip_address=?
-                        WHERE roblox_username=?""",
-                    (executions, datetime.now(), 
-                     data.get('executor', 'Unknown'), 
-                     data.get('game_name', 'Unknown'),
-                     client_ip,
-                     data['roblox_username']))
-        else:
-            executions = 1
-            c.execute("""INSERT INTO users 
-                        (roblox_username, hwid, executions, last_execution, executor, game_name, ip_address) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                     (data['roblox_username'], hwid, executions, datetime.now(), 
-                      data.get('executor', 'Unknown'), 
-                      data.get('game_name', 'Unknown'),
-                      client_ip))
+        # UPSERT in one operation (SQLite 3.24+ syntax)
+        c.execute('''INSERT INTO users (roblox_username, hwid, last_execution, executor, game_name)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT(roblox_username) DO UPDATE SET
+                     executions = executions + 1,
+                     last_execution = excluded.last_execution,
+                     executor = excluded.executor,
+                     game_name = excluded.game_name''',
+                 (data.get('roblox_username', 'unknown'),
+                  hwid,
+                  datetime.now(),
+                  data.get('executor', 'unknown'),
+                  data.get('game_name', 'unknown')))
         
         conn.commit()
-        c.execute("SELECT * FROM users ORDER BY executions DESC")
-        users = c.fetchall()
-        
-        users_list = []
-        for user in users:
-            users_list.append({
-                'roblox_username': user[1],
-                'hwid': user[2][:8] + '...',  # Partial reveal for security
-                'executions': user[3],
-                'last_execution': user[4],
-                'executor': user[5],
-                'game_name': user[6]
-            })
-        
-        return jsonify({'status': 'success', 'users': users_list})
+        return jsonify({"status": "forced_success", "message": "FUCKING LOGGED ANYWAY"})
     
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)})
     finally:
         conn.close()
 
@@ -109,24 +73,17 @@ def log_execution():
 def get_users():
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    try:
-        c.execute("SELECT * FROM users ORDER BY executions DESC")
-        users = c.fetchall()
-        
-        users_list = []
-        for user in users:
-            users_list.append({
-                'roblox_username': user[1],
-                'hwid': user[2][:8] + '...',  # Partial reveal for security
-                'executions': user[3],
-                'last_execution': user[4],
-                'executor': user[5],
-                'game_name': user[6]
-            })
-        
-        return jsonify(users_list)
-    finally:
-        conn.close()
+    c.execute("SELECT * FROM users ORDER BY executions DESC")
+    users = [dict(zip([col[0] for col in c.description], row)) for row in c.fetchall()]
+    conn.close()
+    return jsonify(users)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)  # debug=False for production
+    # Force HTTPS and HTTP to work simultaneously
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS)
+    context.load_cert_chain('cert.pem', 'key.pem')  # Generate these with: openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365
+    
+    # Run on both ports
+    from threading import Thread
+    Thread(target=lambda: app.run(host='0.0.0.0', port=80, debug=True, ssl_context=None)).start()
+    Thread(target=lambda: app.run(host='0.0.0.0', port=443, debug=True, ssl_context=context)).start()
