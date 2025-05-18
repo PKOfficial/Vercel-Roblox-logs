@@ -1,89 +1,101 @@
-from flask import Flask, request, jsonify
+from flask import Flask, render_template, request, jsonify
 import sqlite3
-import uuid
 from datetime import datetime
-import ssl
+import time
 
 app = Flask(__name__)
 
-# Bypass all security measures
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
-app.config['TRAP_HTTP_EXCEPTIONS'] = True
-
-# Disable all security warnings
-import warnings
-warnings.filterwarnings("ignore")
-
-# Force SQLite to work in WAL mode for concurrent access
+# Initialize database
 def init_db():
-    conn = sqlite3.connect('users.db', isolation_level=None)
+    conn = sqlite3.connect('executions.db')
     c = conn.cursor()
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (roblox_username TEXT PRIMARY KEY,
-                  hwid TEXT,
-                  executions INTEGER DEFAULT 1,
-                  last_execution TIMESTAMP,
+    c.execute('''CREATE TABLE IF NOT EXISTS executions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  url TEXT,
+                  username TEXT,
                   executor TEXT,
-                  game_name TEXT)''')
+                  hwid TEXT,
+                  timestamp DATETIME)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS stats
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  total_executions INTEGER DEFAULT 0)''')
+    
+    # Initialize stats if empty
+    c.execute("SELECT COUNT(*) FROM stats")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO stats (total_executions) VALUES (0)")
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/')
 def index():
-    return "Tracking Server Running - Fuck All Restrictions"
+    # Get execution count for the current URL
+    current_url = request.url_root
+    conn = sqlite3.connect('executions.db')
+    c = conn.cursor()
+    
+    # Get URL-specific count
+    c.execute("SELECT COUNT(*) FROM executions WHERE url=?", (current_url,))
+    url_count = c.fetchone()[0]
+    
+    # Get total count
+    c.execute("SELECT total_executions FROM stats WHERE id=1")
+    total_count = c.fetchone()[0]
+    
+    # Get recent executions
+    c.execute("SELECT username, executor, timestamp FROM executions ORDER BY timestamp DESC LIMIT 10")
+    recent_executions = c.fetchall()
+    
+    conn.close()
+    
+    return render_template('index.html', 
+                         url_count=url_count,
+                         total_count=total_count,
+                         recent_executions=recent_executions,
+                         current_url=current_url)
 
-@app.route('/api/log_execution', methods=['GET', 'POST', 'PUT', 'OPTIONS'])
+@app.route('/log_execution', methods=['POST'])
 def log_execution():
-    # Accept any fucking request format
-    data = request.get_json(force=True, silent=True) or request.form or request.args
+    data = request.json
     
-    # Generate HWID if missing
-    hwid = data.get('hwid', str(uuid.uuid4()))
+    # Validate required fields
+    if not all(key in data for key in ['username', 'executor', 'hwid']):
+        return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
     
-    conn = sqlite3.connect('users.db', isolation_level=None)
+    # Insert into database
+    conn = sqlite3.connect('executions.db')
     c = conn.cursor()
     
     try:
-        # UPSERT in one operation (SQLite 3.24+ syntax)
-        c.execute('''INSERT INTO users (roblox_username, hwid, last_execution, executor, game_name)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT(roblox_username) DO UPDATE SET
-                     executions = executions + 1,
-                     last_execution = excluded.last_execution,
-                     executor = excluded.executor,
-                     game_name = excluded.game_name''',
-                 (data.get('roblox_username', 'unknown'),
-                  hwid,
-                  datetime.now(),
-                  data.get('executor', 'unknown'),
-                  data.get('game_name', 'unknown')))
+        # Log the execution
+        c.execute("INSERT INTO executions (url, username, executor, hwid, timestamp) VALUES (?, ?, ?, ?, ?)",
+                 (request.url_root, data['username'], data['executor'], data['hwid'], datetime.now()))
+        
+        # Update total count
+        c.execute("UPDATE stats SET total_executions = total_executions + 1 WHERE id=1")
         
         conn.commit()
-        return jsonify({"status": "forced_success", "message": "FUCKING LOGGED ANYWAY"})
-    
+        
+        # Get updated counts
+        c.execute("SELECT COUNT(*) FROM executions WHERE url=?", (request.url_root,))
+        url_count = c.fetchone()[0]
+        
+        c.execute("SELECT total_executions FROM stats WHERE id=1")
+        total_count = c.fetchone()[0]
+        
+        return jsonify({
+            'status': 'success',
+            'url_count': url_count,
+            'total_count': total_count
+        })
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+        conn.rollback()
+        return jsonify({'status': 'error', 'message': str(e)}), 500
     finally:
         conn.close()
 
-@app.route('/api/get_users', methods=['GET'])
-def get_users():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM users ORDER BY executions DESC")
-    users = [dict(zip([col[0] for col in c.description], row)) for row in c.fetchall()]
-    conn.close()
-    return jsonify(users)
-
 if __name__ == '__main__':
-    # Force HTTPS and HTTP to work simultaneously
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS)
-    context.load_cert_chain('cert.pem', 'key.pem')  # Generate these with: openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365
-    
-    # Run on both ports
-    from threading import Thread
-    Thread(target=lambda: app.run(host='0.0.0.0', port=80, debug=True, ssl_context=None)).start()
-    Thread(target=lambda: app.run(host='0.0.0.0', port=443, debug=True, ssl_context=context)).start()
+    app.run(host='0.0.0.0', port=5000, debug=False)
