@@ -2,10 +2,23 @@ from flask import Flask, render_template, jsonify, request
 import sqlite3
 import uuid
 from datetime import datetime
+import hashlib
 
 app = Flask(__name__)
 
-# Database setup
+# Security enhancement - simple request validation
+VALID_EXECUTORS = ['Synapse', 'ScriptWare', 'Krnl', 'Fluxus', 'Unknown']
+
+def validate_request(data):
+    if not data or 'roblox_username' not in data:
+        return False
+    if 'executor' in data and data['executor'] not in VALID_EXECUTORS:
+        return False
+    return True
+
+def secure_hwid(raw_hwid):
+    return hashlib.sha256(raw_hwid.encode()).hexdigest()
+
 def init_db():
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
@@ -16,7 +29,8 @@ def init_db():
                   executions INTEGER,
                   last_execution TIMESTAMP,
                   executor TEXT,
-                  game_name TEXT)''')
+                  game_name TEXT,
+                  ip_address TEXT)''')
     conn.commit()
     conn.close()
 
@@ -28,80 +42,91 @@ def index():
 
 @app.route('/api/log_execution', methods=['POST'])
 def log_execution():
+    if not validate_request(request.json):
+        return jsonify({'error': 'Invalid request'}), 400
+    
     data = request.json
+    client_ip = request.remote_addr
     
-    # Validate required fields
-    if not data or 'roblox_username' not in data:
-        return jsonify({'error': 'Missing required fields'}), 400
+    # Secure HWID handling
+    raw_hwid = data.get('hwid', str(uuid.uuid4()))
+    hwid = secure_hwid(raw_hwid)
     
-    # Generate or get HWID
-    hwid = data.get('hwid', str(uuid.uuid4()))
-    
-    # Connect to database
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
     
-    # Check if user exists
-    c.execute("SELECT * FROM users WHERE roblox_username=?", (data['roblox_username'],))
-    user = c.fetchone()
+    try:
+        c.execute("SELECT * FROM users WHERE roblox_username=?", (data['roblox_username'],))
+        user = c.fetchone()
+        
+        if user:
+            executions = user[3] + 1
+            c.execute("""UPDATE users SET 
+                        executions=?, 
+                        last_execution=?, 
+                        executor=?, 
+                        game_name=?,
+                        ip_address=?
+                        WHERE roblox_username=?""",
+                    (executions, datetime.now(), 
+                     data.get('executor', 'Unknown'), 
+                     data.get('game_name', 'Unknown'),
+                     client_ip,
+                     data['roblox_username']))
+        else:
+            executions = 1
+            c.execute("""INSERT INTO users 
+                        (roblox_username, hwid, executions, last_execution, executor, game_name, ip_address) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                     (data['roblox_username'], hwid, executions, datetime.now(), 
+                      data.get('executor', 'Unknown'), 
+                      data.get('game_name', 'Unknown'),
+                      client_ip))
+        
+        conn.commit()
+        c.execute("SELECT * FROM users ORDER BY executions DESC")
+        users = c.fetchall()
+        
+        users_list = []
+        for user in users:
+            users_list.append({
+                'roblox_username': user[1],
+                'hwid': user[2][:8] + '...',  # Partial reveal for security
+                'executions': user[3],
+                'last_execution': user[4],
+                'executor': user[5],
+                'game_name': user[6]
+            })
+        
+        return jsonify({'status': 'success', 'users': users_list})
     
-    if user:
-        # Update existing user
-        executions = user[3] + 1
-        c.execute("UPDATE users SET executions=?, last_execution=?, executor=?, game_name=? WHERE roblox_username=?",
-                  (executions, datetime.now(), data.get('executor', 'Unknown'), 
-                   data.get('game_name', 'Unknown'), data['roblox_username']))
-    else:
-        # Create new user
-        executions = 1
-        c.execute("INSERT INTO users (roblox_username, hwid, executions, last_execution, executor, game_name) VALUES (?, ?, ?, ?, ?, ?)",
-                 (data['roblox_username'], hwid, executions, datetime.now(), 
-                  data.get('executor', 'Unknown'), data.get('game_name', 'Unknown')))
-    
-    conn.commit()
-    
-    # Get all users for response
-    c.execute("SELECT * FROM users ORDER BY executions DESC")
-    users = c.fetchall()
-    
-    conn.close()
-    
-    # Format users for response
-    users_list = []
-    for user in users:
-        users_list.append({
-            'id': user[0],
-            'roblox_username': user[1],
-            'hwid': user[2],
-            'executions': user[3],
-            'last_execution': user[4],
-            'executor': user[5],
-            'game_name': user[6]
-        })
-    
-    return jsonify({'message': 'Execution logged successfully', 'users': users_list})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
 
 @app.route('/api/get_users', methods=['GET'])
 def get_users():
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    c.execute("SELECT * FROM users ORDER BY executions DESC")
-    users = c.fetchall()
-    conn.close()
-    
-    users_list = []
-    for user in users:
-        users_list.append({
-            'id': user[0],
-            'roblox_username': user[1],
-            'hwid': user[2],
-            'executions': user[3],
-            'last_execution': user[4],
-            'executor': user[5],
-            'game_name': user[6]
-        })
-    
-    return jsonify(users_list)
+    try:
+        c.execute("SELECT * FROM users ORDER BY executions DESC")
+        users = c.fetchall()
+        
+        users_list = []
+        for user in users:
+            users_list.append({
+                'roblox_username': user[1],
+                'hwid': user[2][:8] + '...',  # Partial reveal for security
+                'executions': user[3],
+                'last_execution': user[4],
+                'executor': user[5],
+                'game_name': user[6]
+            })
+        
+        return jsonify(users_list)
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)  # debug=False for production
